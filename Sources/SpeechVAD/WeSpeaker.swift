@@ -147,17 +147,29 @@ public final class WeSpeakerModel {
                     reason: "CoreML model not found at \(modelURL.path)")
             }
 
+            // macOS 26 fails to load this enumerated-shape model on the Neural
+            // Engine (E5RT "tensor_buffer has known strides while the model has
+            // FlexibleShapeInfo" / ANECCompile CompilationFailure). .cpuAndGPU
+            // excludes the ANE entirely and runs the conv-heavy ResNet34 faster
+            // than .cpuOnly; .cpuOnly is the retry-on-throw fallback for any
+            // future OS that also rejects the GPU path.
             let mlConfig = MLModelConfiguration()
-            mlConfig.computeUnits = .cpuAndNeuralEngine
+            mlConfig.computeUnits = .cpuAndGPU
 
             let model: MLModel
             do {
                 model = try MLModel(contentsOf: modelURL, configuration: mlConfig)
             } catch {
-                throw AudioModelError.modelLoadFailed(
-                    modelId: resolvedModelId,
-                    reason: "Failed to load CoreML model",
-                    underlying: error)
+                let cpuConfig = MLModelConfiguration()
+                cpuConfig.computeUnits = .cpuOnly
+                do {
+                    model = try MLModel(contentsOf: modelURL, configuration: cpuConfig)
+                } catch {
+                    throw AudioModelError.modelLoadFailed(
+                        modelId: resolvedModelId,
+                        reason: "Failed to load CoreML model",
+                        underlying: error)
+                }
             }
 
             progressHandler?(1.0, "Ready")
