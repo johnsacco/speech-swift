@@ -118,8 +118,41 @@ public class ParakeetASRModel {
 
     // MARK: - CoreML Inference Helpers
 
-    /// Enumerated mel frame lengths supported by the encoder CoreML model.
-    private static let enumeratedMelLengths = [100, 200, 300, 400, 500, 750, 1000, 1500, 2000, 3000]
+    /// Enumerated mel frame lengths of the original (April 2026) encoder — the
+    /// fallback when a loaded encoder does not state its own.
+    static let enumeratedMelLengths = [100, 200, 300, 400, 500, 750, 1000, 1500, 2000, 3000]
+
+    /// The mel lengths the LOADED encoder accepts, read from its own model
+    /// description. The June 2026 multi-encoder layout ships `encoder.mlmodelc`
+    /// as a fixed 3000-frame (30 s) model whose metadata.json still lists the
+    /// ten enumerated lengths; padding to 200 then fails every load with
+    /// "MultiArray shape (1 x 128 x 200) does not match (1 x 128 x 3000)".
+    /// The encoder masks by `length`, so padding to a larger accepted length
+    /// leaves the transcript unchanged.
+    private lazy var acceptedMelLengths: [Int] = Self.melLengths(acceptedBy: encoder)
+
+    static func melLengths(acceptedBy encoder: MLModel?) -> [Int] {
+        guard let constraint = encoder?.modelDescription.inputDescriptionsByName["mel"]?.multiArrayConstraint else {
+            return enumeratedMelLengths
+        }
+        var lengths = Set<Int>()
+        if constraint.shapeConstraint.type == .enumerated {
+            for shape in constraint.shapeConstraint.enumeratedShapes where shape.count == 3 {
+                lengths.insert(shape[2].intValue)
+            }
+        } else if constraint.shapeConstraint.type == .range {
+            // A range shape takes any length up to its upper bound.
+            let ranges = constraint.shapeConstraint.sizeRangeForDimension
+            if ranges.count == 3 {
+                let range = ranges[2].rangeValue
+                return enumeratedMelLengths.filter { $0 >= range.location && $0 <= range.location + range.length }
+            }
+        }
+        if lengths.isEmpty, constraint.shape.count == 3 {
+            lengths.insert(constraint.shape[2].intValue)
+        }
+        return lengths.isEmpty ? enumeratedMelLengths : lengths.sorted()
+    }
 
     /// Pad mel spectrogram to the nearest enumerated shape.
     /// The encoder uses EnumeratedShapes to avoid a BNNS crash with dynamic shapes.
@@ -127,10 +160,11 @@ public class ParakeetASRModel {
         let melFrames = mel.shape[2].intValue
 
         // Find the smallest enumerated length >= melFrames
-        guard let targetLength = Self.enumeratedMelLengths.first(where: { $0 >= melFrames }) else {
+        let accepted = acceptedMelLengths
+        guard let targetLength = accepted.first(where: { $0 >= melFrames }) else {
             throw AudioModelError.inferenceFailed(
                 operation: "mel padding",
-                reason: "Audio too long: \(melFrames) mel frames exceeds max \(Self.enumeratedMelLengths.last!) (30s)")
+                reason: "Audio too long: \(melFrames) mel frames exceeds max \(accepted.last ?? 0)")
         }
 
         if targetLength == melFrames {
